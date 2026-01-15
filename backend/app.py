@@ -24,73 +24,54 @@ app_config = {
 }
 
 # --- VIDEO PIPELINE ---
-# ... imports remain same ...
-
-# --- PERFORMANCE CONFIG ---
-# Target resolution for the browser (720p is the sweet spot for web dashboards)
-TARGET_WIDTH = 1280
-TARGET_HEIGHT = 720
-# Skip frames to reduce CPU/Bandwidth load (Process 1 out of every N frames)
-FRAME_SKIP = 2 
-
 def generate_frames():
-    """Generate video frames with performance optimization"""
+    """Generate video frames from the current source"""
     with app_config["lock"]:
         current_source = app_config["source"]
         app_config["active_streams"] += 1
     
     print(f"📷 Starting Stream from source: {current_source}")
     
-    # FORCE TCP: This fixes "smearing" and green/grey artifacts on RTSP
-    if isinstance(current_source, str):
-        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
-        
+    # Initialize camera with timeout
     camera = cv2.VideoCapture(current_source)
     
-    # Set buffer size to 1 to reduce internal latency
-    camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    # Set timeout for network streams
+    if isinstance(current_source, str):
+        camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     
     if not camera.isOpened():
         print(f"❌ Error: Could not open video source: {current_source}")
-        error_frame = create_error_frame("Failed to connect")
+        # Return error frame
+        error_frame = create_error_frame("Failed to connect to video source")
         ret, buffer = cv2.imencode('.jpg', error_frame)
+        frame_bytes = buffer.tobytes()
+        
         with app_config["lock"]:
             app_config["active_streams"] -= 1
-        yield (b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+        
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
         return
-
-    frame_count = 0
 
     try:
         while True:
             success, frame = camera.read()
             
             if not success:
-                # Reconnection logic
+                print("⚠️ Failed to read frame, attempting to reconnect...")
+                # Try to reconnect for streams
                 if isinstance(current_source, str):
-                    print("⚠️ Stream dropped. Reconnecting...")
                     camera.release()
                     time.sleep(1)
                     camera = cv2.VideoCapture(current_source)
+                    if not camera.isOpened():
+                        break
                 else:
+                    # For file/webcam, loop back
                     camera.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 continue
-
-            # --- OPTIMIZATION 1: FRAME SKIPPING ---
-            # Only process every Nth frame to save CPU/Bandwidth
-            frame_count += 1
-            if frame_count % FRAME_SKIP != 0:
-                continue
             
-            # --- OPTIMIZATION 2: RESIZING ---
-            # Downscale high-res streams to 720p for the browser
-            # This fixes the "Lag" and actually improves perceived sharpness 
-            # because the browser doesn't have to struggle resizing a massive 4k image.
-            h, w = frame.shape[:2]
-            if w > TARGET_WIDTH:
-                frame = cv2.resize(frame, (TARGET_WIDTH, TARGET_HEIGHT))
-
-            # Encode frame (Quality 85 is good balance)
+            # Encode frame
             ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
             if not ret:
                 continue
@@ -100,13 +81,16 @@ def generate_frames():
             yield (b'--frame\r\n'
                    b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
     
+    except GeneratorExit:
+        print("🔌 Client disconnected")
     except Exception as e:
         print(f"❌ Stream error: {e}")
     finally:
         camera.release()
         with app_config["lock"]:
             app_config["active_streams"] -= 1
-        print(f"🛑 Stream stopped.")
+        print(f"🛑 Stream stopped. Active streams: {app_config['active_streams']}")
+
 def create_error_frame(message):
     """Create a black frame with error message"""
     import numpy as np

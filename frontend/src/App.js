@@ -397,9 +397,8 @@ function App() {
               onChange={(e) => setVolume(e.target.value)}
               disabled={true}
               className="slider"
-              title="Audio not supported - MJPEG streams are video-only"
+              title="Audio not supported in Low-Latency MJPEG mode"
             />
-            <span className="volume-text">{volume}%</span>
           </div>
 
           <div className="toggle-group">
