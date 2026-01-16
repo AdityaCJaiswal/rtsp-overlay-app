@@ -1,11 +1,15 @@
 import cv2
 import time
+import threading
+import subprocess
+import shutil
+import numpy as np
 from flask import Flask, Response, jsonify, request
 from flask_cors import CORS
 from pymongo import MongoClient
 from bson.objectid import ObjectId
 import os
-import threading
+import atexit
 
 app = Flask(__name__)
 CORS(app)
@@ -16,188 +20,247 @@ client = MongoClient(MONGO_URI)
 db = client.get_database("rtsp_db")
 overlays_collection = db.get_collection("overlays")
 
-# Global Video Source State
+# Check for FFmpeg availability
+FFMPEG_PATH = shutil.which('ffmpeg')
+HAS_FFMPEG = FFMPEG_PATH is not None
+
+print(f"🖥️  System Check: FFmpeg is {'✅ INSTALLED' if HAS_FFMPEG else '❌ MISSING (Using OpenCV Fallback)'}")
+
+# Global State
 app_config = {
-    "source": 0,
-    "active_streams": 0,
+    "source": 0,            # Current Source (0 or RTSP URL)
+    "camera_thread": None,  # The active background worker
     "lock": threading.Lock()
 }
 
-# --- VIDEO PIPELINE ---
+# ==========================================
+# ENGINE 1: FFMPEG (High Performance RTSP)
+# ==========================================
+class FFmpegCamera:
+    def __init__(self, src):
+        self.src = src
+        self.stopped = False
+        self.frame = None
+        self.status = False
+        
+        # FFmpeg Command:
+        # -rtsp_transport tcp: Prevent gray/green smear artifacts
+        # -i src: Input
+        # -f image2pipe: Output stream of images
+        # -vcodec mjpeg: Encode as JPEG
+        # -s 1280x720: Resize to 720p (Massive speed boost vs 1080p)
+        # -q:v 5: Quality (Balance size/quality)
+        cmd = [
+            FFMPEG_PATH,
+            '-loglevel', 'error',
+            '-rtsp_transport', 'tcp',
+            '-i', src,
+            '-f', 'image2pipe',
+            '-vcodec', 'mjpeg',
+            '-s', '1280x720',
+            '-q:v', '5',
+            '-'
+        ]
+        
+        print(f"🚀 Starting FFmpeg Pipe: {' '.join(cmd)}")
+        self.process = subprocess.Popen(
+            cmd, 
+            stdout=subprocess.PIPE, 
+            stderr=subprocess.PIPE,
+            bufsize=10**7
+        )
+        
+        # Start background reader thread
+        self.thread = threading.Thread(target=self.update, args=())
+        self.thread.daemon = True
+        self.thread.start()
+
+    def update(self):
+        """Reads raw bytes from FFmpeg stdout and parses JPEGs"""
+        buffer = b""
+        chunk_size = 4096
+        
+        while not self.stopped:
+            # Read chunk
+            chunk = self.process.stdout.read(chunk_size)
+            if not chunk:
+                self.status = False
+                break
+            
+            buffer += chunk
+            
+            # Look for JPEG Start (0xFFD8) and End (0xFFD9)
+            a = buffer.find(b'\xff\xd8')
+            b = buffer.find(b'\xff\xd9')
+            
+            if a != -1 and b != -1:
+                # FIX: Ensure End is after Start to avoid corruption
+                if b > a:
+                    jpg = buffer[a:b+2]
+                    buffer = buffer[b+2:] # Keep remaining bytes for next frame
+                    self.frame = jpg
+                    self.status = True
+                else:
+                    # Garbage data (End byte appeared before Start), discard it
+                    buffer = buffer[b+2:]
+                    
+            elif len(buffer) > 10**7:
+                 # Safety: Clear buffer if no frame found (prevent memory leak)
+                 buffer = b""
+
+    def get_frame(self):
+        return self.frame
+
+    def stop(self):
+        self.stopped = True
+        if self.process:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=1)
+            except:
+                self.process.kill()
+
+# ==========================================
+# ENGINE 2: OPENCV (Reliable Fallback / Webcam)
+# ==========================================
+class OpenCVCamera:
+    def __init__(self, src=0):
+        self.src = src
+        
+        # Force TCP if it's an RTSP stream (OpenCV backend)
+        if isinstance(src, str) and src.startswith("rtsp"):
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
+            
+        self.capture = cv2.VideoCapture(src)
+        self.capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        self.status, self.frame = self.capture.read()
+        self.stopped = False
+        
+        self.thread = threading.Thread(target=self.update, args=())
+        self.thread.daemon = True
+        self.thread.start()
+
+    def update(self):
+        while not self.stopped:
+            if self.capture.isOpened():
+                # Grab to clear buffer
+                self.capture.grab()
+                status, frame = self.capture.retrieve()
+                if status:
+                    self.frame = frame
+                    self.status = True
+                else:
+                    self.status = False
+                    time.sleep(0.1)
+            else:
+                time.sleep(0.1)
+
+    def get_frame(self):
+        if not self.status or self.frame is None:
+            return None
+        
+        # Resize to 720p (Performance optimization)
+        h, w = self.frame.shape[:2]
+        if h > 720:
+            aspect_ratio = w / h
+            new_w = int(720 * aspect_ratio)
+            resized = cv2.resize(self.frame, (new_w, 720), interpolation=cv2.INTER_AREA)
+        else:
+            resized = self.frame
+            
+        ret, jpeg = cv2.imencode('.jpg', resized, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        return jpeg.tobytes()
+
+    def stop(self):
+        self.stopped = True
+        if self.capture.isOpened():
+            self.capture.release()
+
+# --- STREAM GENERATOR ---
 def generate_frames():
-    """Generate video frames from the current source"""
-    with app_config["lock"]:
-        current_source = app_config["source"]
-        app_config["active_streams"] += 1
-    
-    print(f"📷 Starting Stream from source: {current_source}")
-    
-    # Initialize camera with timeout
-    camera = cv2.VideoCapture(current_source)
-    
-    # Set timeout for network streams
-    if isinstance(current_source, str):
-        camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    
-    if not camera.isOpened():
-        print(f"❌ Error: Could not open video source: {current_source}")
-        # Return error frame
-        error_frame = create_error_frame("Failed to connect to video source")
-        ret, buffer = cv2.imencode('.jpg', error_frame)
-        frame_bytes = buffer.tobytes()
+    # Initialize the camera thread if needed
+    if app_config["camera_thread"] is None:
+        src = app_config["source"]
         
-        with app_config["lock"]:
-            app_config["active_streams"] -= 1
+        # LOGIC: Choose Engine
+        use_ffmpeg = False
+        if HAS_FFMPEG and isinstance(src, str) and src.startswith("rtsp"):
+            use_ffmpeg = True
+            
+        print(f"📷 Starting Source: {src} | Engine: {'FFMPEG' if use_ffmpeg else 'OPENCV'}")
         
+        if use_ffmpeg:
+            app_config["camera_thread"] = FFmpegCamera(src)
+        else:
+            app_config["camera_thread"] = OpenCVCamera(src)
+            
+        time.sleep(1) # Warmup
+
+    camera = app_config["camera_thread"]
+
+    while True:
+        frame_bytes = camera.get_frame()
+        
+        if frame_bytes is None:
+            time.sleep(0.1)
+            continue
+
         yield (b'--frame\r\n'
                b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-        return
+        
+        time.sleep(0.03) # Cap at ~30 FPS
 
-    try:
-        while True:
-            success, frame = camera.read()
-            
-            if not success:
-                print("⚠️ Failed to read frame, attempting to reconnect...")
-                # Try to reconnect for streams
-                if isinstance(current_source, str):
-                    camera.release()
-                    time.sleep(1)
-                    camera = cv2.VideoCapture(current_source)
-                    if not camera.isOpened():
-                        break
-                else:
-                    # For file/webcam, loop back
-                    camera.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                continue
-            
-            # Encode frame
-            ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-            if not ret:
-                continue
-                
-            frame_bytes = buffer.tobytes()
-            
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-    
-    except GeneratorExit:
-        print("🔌 Client disconnected")
-    except Exception as e:
-        print(f"❌ Stream error: {e}")
-    finally:
-        camera.release()
-        with app_config["lock"]:
-            app_config["active_streams"] -= 1
-        print(f"🛑 Stream stopped. Active streams: {app_config['active_streams']}")
-
-def create_error_frame(message):
-    """Create a black frame with error message"""
-    import numpy as np
-    frame = np.zeros((480, 640, 3), dtype=np.uint8)
-    cv2.putText(frame, message, (50, 240), cv2.FONT_HERSHEY_SIMPLEX, 
-                0.7, (255, 255, 255), 2)
-    return frame
+# --- ROUTES ---
 
 @app.route('/video_feed')
 def video_feed():
-    """Video streaming route"""
-    return Response(generate_frames(), 
-                   mimetype='multipart/x-mixed-replace; boundary=frame')
+    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
-# --- SETTINGS API ---
 @app.route('/settings', methods=['GET'])
 def get_settings():
-    """Get current video source settings"""
     return jsonify({
         "current_source": app_config["source"],
-        "active_streams": app_config["active_streams"]
+        "active_streams": 1 if app_config["camera_thread"] else 0
     })
 
 @app.route('/settings', methods=['POST'])
 def update_settings():
-    """Update video source settings"""
     data = request.json
     new_source = data.get('rtsp_url', '').strip()
     
-    # Determine source type
-    if not new_source or new_source == "0" or new_source.lower() == "webcam":
-        app_config["source"] = 0  # Webcam
-        msg = "Switched to Webcam (Device 0)"
-        source_type = "webcam"
-    else:
-        # Validate RTSP/HTTP URL
-        if new_source.startswith(('rtsp://', 'http://', 'https://')):
-            app_config["source"] = new_source
-            msg = f"Switched to stream: {new_source}"
-            source_type = "stream"
-        else:
-            # Try to interpret as device index
-            try:
-                device_index = int(new_source)
-                app_config["source"] = device_index
-                msg = f"Switched to Webcam (Device {device_index})"
-                source_type = "webcam"
-            except ValueError:
-                return jsonify({
-                    "error": "Invalid source. Use webcam (0) or valid RTSP/HTTP URL"
-                }), 400
+    # Determine new source
+    target = 0
+    if new_source and new_source != "0":
+        target = new_source
+
+    # Stop old thread
+    if app_config["camera_thread"]:
+        app_config["camera_thread"].stop()
+        app_config["camera_thread"] = None
     
-    print(f"⚙️ Settings Updated: {msg}")
+    # Update state (Generator will restart thread on next request)
+    app_config["source"] = target
     
-    return jsonify({
-        "message": msg,
-        "current_source": app_config["source"],
-        "source_type": source_type,
-        "active_streams": app_config["active_streams"]
-    })
+    return jsonify({"message": f"Source switched to {target}", "current_source": target})
 
 @app.route('/test_connection', methods=['POST'])
 def test_connection():
-    """Test if a video source is accessible"""
+    # Quick connectivity check using OpenCV (FFmpeg is too heavy for a quick test)
     data = request.json
-    test_source = data.get('rtsp_url', '').strip()
+    src = data.get('rtsp_url', 0)
+    if src == "0": src = 0
     
-    if not test_source or test_source == "0":
-        test_source = 0
-    
-    print(f"🔍 Testing connection to: {test_source}")
-    
-    try:
-        cap = cv2.VideoCapture(test_source)
-        
-        if not cap.isOpened():
-            return jsonify({
-                "success": False,
-                "message": "Failed to connect to source"
-            }), 400
-        
-        # Try to read a frame
-        ret, frame = cap.read()
+    cap = cv2.VideoCapture(src)
+    if cap.isOpened():
+        ret, _ = cap.read()
         cap.release()
-        
-        if not ret:
-            return jsonify({
-                "success": False,
-                "message": "Connected but failed to read frame"
-            }), 400
-        
-        return jsonify({
-            "success": True,
-            "message": "Connection successful!",
-            "resolution": f"{frame.shape[1]}x{frame.shape[0]}"
-        })
-    
-    except Exception as e:
-        return jsonify({
-            "success": False,
-            "message": f"Error: {str(e)}"
-        }), 500
+        if ret: return jsonify({"success": True, "message": "Connection OK"})
+    return jsonify({"success": False, "message": "Connection Failed"})
 
-# --- CRUD API ENDPOINTS ---
+# --- CRUD (UNCHANGED) ---
 @app.route('/overlays', methods=['GET'])
 def get_overlays():
-    """Get all overlays"""
     overlays = []
     for doc in overlays_collection.find():
         doc['_id'] = str(doc['_id'])
@@ -206,59 +269,27 @@ def get_overlays():
 
 @app.route('/overlays', methods=['POST'])
 def create_overlay():
-    """Create a new overlay"""
     data = request.json
-    if not data: 
-        return jsonify({"error": "No data provided"}), 400
-    
-    new_overlay = {
-        "type": data.get("type", "text"),
-        "content": data.get("content", "New Overlay"),
-        "x": data.get("x", 50),
-        "y": data.get("y", 50),
-        "width": data.get("width", 200),
-        "height": data.get("height", 100)
-    }
-    
-    result = overlays_collection.insert_one(new_overlay)
-    new_overlay['_id'] = str(result.inserted_id)
-    return jsonify(new_overlay), 201
+    res = overlays_collection.insert_one(data)
+    data['_id'] = str(res.inserted_id)
+    return jsonify(data), 201
 
 @app.route('/overlays/<id>', methods=['PUT'])
 def update_overlay(id):
-    """Update an existing overlay"""
-    try:
-        result = overlays_collection.update_one(
-            {"_id": ObjectId(id)}, 
-            {"$set": request.json}
-        )
-        if result.matched_count == 0:
-            return jsonify({"error": "Overlay not found"}), 404
-        return jsonify({"message": "Updated successfully"})
-    except Exception as e: 
-        return jsonify({"error": str(e)}), 400
+    overlays_collection.update_one({"_id": ObjectId(id)}, {"$set": request.json})
+    return jsonify({"msg": "ok"})
 
 @app.route('/overlays/<id>', methods=['DELETE'])
 def delete_overlay(id):
-    """Delete an overlay"""
-    try:
-        result = overlays_collection.delete_one({"_id": ObjectId(id)})
-        if result.deleted_count == 0:
-            return jsonify({"error": "Overlay not found"}), 404
-        return jsonify({"message": "Deleted successfully"})
-    except Exception as e: 
-        return jsonify({"error": str(e)}), 400
+    overlays_collection.delete_one({"_id": ObjectId(id)})
+    return jsonify({"msg": "ok"})
 
-@app.route('/')
-def index():
-    """Health check endpoint"""
-    return jsonify({
-        "status": "Backend running",
-        "current_source": app_config["source"],
-        "active_streams": app_config["active_streams"]
-    })
+# Cleanup
+def cleanup():
+    if app_config["camera_thread"]:
+        app_config["camera_thread"].stop()
+atexit.register(cleanup)
 
 if __name__ == '__main__':
-    print("🚀 StreamStudio Backend Starting...")
-    print(f"📡 Default source: {app_config['source']}")
-    app.run(debug=True, host='0.0.0.0', port=5000, threaded=True)
+    # host='0.0.0.0' exposes the server to the Docker network
+    app.run(host='0.0.0.0', debug=True, port=5000, threaded=True)

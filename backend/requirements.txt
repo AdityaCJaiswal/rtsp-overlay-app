@@ -1,0 +1,5 @@
+flask
+flask-cors
+pymongo
+opencv-python-headless
+numpy

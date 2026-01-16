@@ -88,6 +88,11 @@ function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [testingConnection, setTestingConnection] = useState(false);
 
+  // --- FIX START: Stream Key State ---
+  // This ensures the video only reloads when WE tell it to, not on every render.
+  const [streamKey, setStreamKey] = useState(Date.now());
+  // --- FIX END ---
+
   useEffect(() => {
     fetchOverlays();
     fetchCurrentSettings();
@@ -136,6 +141,11 @@ function App() {
         setCurrentSource(data.current_source === 0 ? "Webcam" : data.current_source);
         setShowSettings(false);
         
+        // --- FIX START: Update Stream Key ---
+        // Force the image tag to reload only when source changes
+        setStreamKey(Date.now());
+        // --- FIX END ---
+
         // Restart stream if currently playing
         if (isPlaying) {
           setIsPlaying(false);
@@ -418,7 +428,9 @@ function App() {
           <div className="video-wrapper">
             {isPlaying ? (
               <img 
-                src={`${API_URL}/video_feed?t=${Date.now()}`} 
+                /* FIX START: Use streamKey instead of Date.now() */
+                src={`${API_URL}/video_feed?t=${streamKey}`} 
+                /* FIX END */
                 alt="Stream" 
                 className="video-stream"
               />
