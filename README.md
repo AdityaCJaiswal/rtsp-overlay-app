@@ -2,8 +2,7 @@
 
 StreamStudio is a low-latency, full-stack video overlay application designed for broadcast and monitoring environments. It allows users to overlay dynamic text and images onto live video feeds (RTSP or Webcam) with sub-200ms latency.
 
-![StreamStudio Screenshot](./docs/screenshot.png)
-*(Screenshot placeholder - add your actual screenshot to `/docs/screenshot.png`)*
+![StreamStudio Screenshot](./screenshot.png)
 
 ---
 
@@ -339,11 +338,11 @@ numpy==1.24.3
 
 ## 🚀 Future Enhancements
 
-- [ ] WebRTC integration for low-latency audio
-- [ ] Multi-stream support (Picture-in-Picture)
-- [ ] Overlay animation effects (fade in/out)
-- [ ] Export overlay configurations as JSON
-- [ ] User authentication & stream access control
+- WebRTC integration for low-latency audio
+- Multi-stream support (Picture-in-Picture)
+- Overlay animation effects (fade in/out)
+- Export overlay configurations as JSON
+- User authentication & stream access control
 
 ---
 
@@ -375,8 +374,8 @@ Full Stack Engineer | High-Performance Video Systems
 This project was built as part of the **RTSP Livestream Overlay Web Application** assignment.
 
 **Submission Details**: 
-- 🎥 Demo Video: [Link to video](https://yourdemolink.com)
-- 💻 GitHub: [https://github.com/yourusername/streamstudio](https://github.com/AdityaCJaiswal/rtsp-overlay-app)
+- 🎥 Demo Video: [Link to video](https://youtu.be/XPwn3be6KI4)
+- 💻 GitHub: [https://github.com/AdityaCJaiswal/rtsp-overlay-app](https://github.com/AdityaCJaiswal/rtsp-overlay-app)
 
 ---
 
